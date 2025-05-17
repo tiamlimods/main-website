@@ -1,0 +1,97 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'package.json'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整提交历史用于生成changelog
+
+      - name: Fetch existing tags
+        run: git fetch --tags
+
+      - name: Get version info
+        id: version
+        run: |
+          VERSION=$(jq -r .version package.json)
+          TAG_NAME="v$VERSION"
+          
+          # 识别预发布版本
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="false"
+          fi
+
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
+
+      - name: Extract commit message
+        id: commit-msg
+        run: |
+          COMMIT_HASH=$(git log -1 --pretty=format:%H -- package.json)
+          COMMIT_MSG=$(git log -1 --pretty=format:%B $COMMIT_HASH | sed 's/\\/\\\\/g; s/"/\\"/g')
+          echo "message=$COMMIT_MSG" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # 获取前一个正式版本标签
+          LATEST_TAG=$(git describe --tags --match "v*" --abbrev=0 2>/dev/null || echo "")
+          
+          # 生成Markdown格式的变更日志
+          if [ -z "$LATEST_TAG" ]; then
+            CHANGELOG="* 初始版本 - 无历史版本可比较 *"
+            echo "prev_tag=初始版本" >> $GITHUB_OUTPUT
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s [%h](https://github.com/$GITHUB_REPOSITORY/commit/%H)" $LATEST_TAG..HEAD -- . ":!package.json")
+            echo "prev_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            
+            # 如果没有变更日志内容则添加提示
+            if [ -z "$CHANGELOG" ]; then
+              CHANGELOG="* 未检测到重要代码变更 *"
+            fi
+          fi
+          
+          echo "log<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Git tag
+        if: steps.version.outputs.tag != ''
+        run: |
+          if ! git rev-parse ${{ steps.version.outputs.tag }} >/dev/null 2>&1; then
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git tag ${{ steps.version.outputs.tag }} -m "${{ steps.commit-msg.outputs.message }}"
+            git push origin ${{ steps.version.outputs.tag }}
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "发布 ${{ steps.version.outputs.tag }}"
+          body: |
+            ### 发布说明
+            ${{ steps.commit-msg.outputs.message }}
+            
+            ### 变更日志 (自 ${{ steps.changelog.outputs.prev_tag || '初始版本' }})
+            ${{ steps.changelog.outputs.log }}
+            
+            _自动生成于 [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})_
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
